@@ -8,7 +8,7 @@ import requests
 
 st.set_page_config(page_title="Stock Options Pricer", layout="wide", page_icon="📈")
 
-# ── Black-Scholes ─────────────────────────────────────
+# ── Black-Scholes ──────────────────────────────────────
 def bs(S, K, T, r, sig, kind):
     if T <= 0:
         return max(0, S - K) if kind == "call" else max(0, K - S)
@@ -37,6 +37,7 @@ def greeks(S, K, T, r, sig):
         "Rho Put /1% r":  round(-K * T * np.exp(-r * T) * norm.cdf(-d2) / 100, 4),
     }
 
+# ── Data fetching ──────────────────────────────────────
 @st.cache_data(ttl=60)
 def fetch_stock(ticker):
     try:
@@ -60,7 +61,6 @@ def fetch_stock(ticker):
 
 @st.cache_data(ttl=3600)
 def resolve_ticker(query):
-    """Convert a company name or partial ticker into a valid ticker symbol."""
     query = query.strip()
     if not query:
         return None, None
@@ -83,12 +83,15 @@ def resolve_ticker(query):
         return symbol, name
     except Exception:
         return query.upper(), None
-    if price < 5:     return 0.05
-    if price < 20:    return 0.5
-    if price < 50:    return 1.0
-    if price < 200:   return 2.5
-    if price < 500:   return 5.0
-    if price < 1000:  return 10.0
+
+# ── Helpers ────────────────────────────────────────────
+def strike_step(price):
+    if price < 5:    return 0.05
+    if price < 20:   return 0.5
+    if price < 50:   return 1.0
+    if price < 200:  return 2.5
+    if price < 500:  return 5.0
+    if price < 1000: return 10.0
     return 25.0
 
 def gen_strikes(S, n=12):
@@ -96,15 +99,16 @@ def gen_strikes(S, n=12):
     base = round(round(S / step) * step, 4)
     return sorted(set(round(base + step * i, 4) for i in range(-5, n - 5) if base + step * i > 0))
 
-# ── Sidebar ───────────────────────────────────────────
+# ── Sidebar ────────────────────────────────────────────
 with st.sidebar:
     st.title("📈 Stock Options Pricer")
     st.caption("Live Black-Scholes for any stock")
 
-    ticker_input = st.text_input("Search stock", value="SPCX",
-                                 help="Type company name (Tesla) or ticker (TSLA)").strip()
+    ticker_input = st.text_input(
+        "Search stock", value="SPCX",
+        help="Type company name (Tesla) or ticker (TSLA)"
+    ).strip()
 
-    # Resolve company name → ticker
     resolved_ticker, resolved_name = resolve_ticker(ticker_input)
 
     if resolved_ticker and resolved_ticker.upper() != ticker_input.upper():
@@ -119,7 +123,7 @@ with st.sidebar:
 
     live_price, prev_price, hist, hvol, company_name = result
     daily_chg = round(live_price - prev_price, 2)
-    daily_pct  = round(daily_chg / prev_price * 100, 2) if prev_price else 0
+    daily_pct = round(daily_chg / prev_price * 100, 2) if prev_price else 0
 
     if daily_chg >= 0:
         st.success(f"**${live_price:,.2f}**  ▲ +${daily_chg} (+{daily_pct}%) today")
@@ -131,64 +135,61 @@ with st.sidebar:
 
     st.subheader("Black-Scholes inputs")
 
-    step = strike_step(live_price)
-    lo   = max(step, round(live_price * 0.25, 4))
-    hi_s = round(live_price * 4.0, 4)
-    hi_k = round(live_price * 3.0, 4)
+    step  = strike_step(live_price)
+    lo    = round(max(step, round(live_price * 0.25 / step) * step), 4)
+    hi_s  = round(round(live_price * 4.0 / step) * step, 4)
+    hi_k  = round(round(live_price * 3.0 / step) * step, 4)
+    s_def = round(round(live_price / step) * step, 4)
 
-    S = st.slider("S — Stock price ($)", min_value=lo, max_value=hi_s,
-                  value=float(live_price), step=step,
-                  help="Current stock price. Defaults to live price — adjust to model scenarios.")
-
-    K = st.slider("K — Strike price ($)", min_value=lo, max_value=hi_k,
-                  value=float(round(round(live_price / step) * step, 4)), step=step,
-                  help="The fixed price in the option contract.")
-
-    T_days = st.slider("T — Days to expiry", min_value=1, max_value=730, value=180, step=1,
-                       help="Number of calendar days until the option expires.")
+    S = st.slider(
+        "S — Stock price ($)", min_value=lo, max_value=hi_s,
+        value=float(s_def), step=float(step),
+        help="Defaults to live price — drag to model scenarios."
+    )
+    K = st.slider(
+        "K — Strike price ($)", min_value=lo, max_value=hi_k,
+        value=float(s_def), step=float(step),
+        help="The fixed price written into the option contract."
+    )
+    T_days = st.slider("T — Days to expiry", min_value=1, max_value=730, value=180, step=1)
     T = T_days / 365
 
-    r_pct = st.slider("r — Risk-free rate (%)", min_value=0.0, max_value=15.0,
-                      value=4.0, step=0.25,
-                      help="US Treasury yield used as the risk-free rate.")
+    r_pct = st.slider("r — Risk-free rate (%)", min_value=0.0, max_value=15.0, value=4.0, step=0.25)
     r = r_pct / 100
 
     default_vol = max(10, min(int(hvol), 200)) if hvol else 30
     sig_pct = st.slider("σ — Implied volatility (%)", min_value=5, max_value=300,
                         value=default_vol, step=1,
-                        help="Annualised volatility assumption. Defaults to 30-day historical vol.")
+                        help="Defaults to 30-day historical vol of the stock.")
     sigma = sig_pct / 100
 
     st.divider()
     st.caption("All prices update instantly as you move any slider.")
 
-# ── Main ──────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────
 st.header(f"{company_name}  ·  {ticker}")
 
-# Summary cards
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("S  (stock price)",  f"${S:,.2f}")
-c2.metric("K  (strike)",       f"${K:,.2f}")
-c3.metric("T  (days)",         T_days)
-c4.metric("r  (rate)",         f"{r_pct:.2f}%")
-c5.metric("σ  (vol)",          f"{sig_pct}%")
-c6.metric("T  (years)",        f"{T:.4f}")
+c1.metric("S  (stock price)", f"${S:,.2f}")
+c2.metric("K  (strike)",      f"${K:,.2f}")
+c3.metric("T  (days)",        T_days)
+c4.metric("r  (rate)",        f"{r_pct:.2f}%")
+c5.metric("σ  (vol)",         f"{sig_pct}%")
+c6.metric("T  (years)",       f"{T:.4f}")
 
 st.divider()
 
-# Call & put for selected K
-call_px  = bs(S, K, T, r, sigma, "call")
-put_px   = bs(S, K, T, r, sigma, "put")
-c_int    = max(0.0, S - K)
-p_int    = max(0.0, K - S)
+call_px = bs(S, K, T, r, sigma, "call")
+put_px  = bs(S, K, T, r, sigma, "put")
+c_int   = max(0.0, S - K)
+p_int   = max(0.0, K - S)
 
 left, right = st.columns(2)
-left.metric("Call price at K",  f"${call_px:.4f}",
-            delta=f"Intrinsic ${c_int:.2f}  +  Time ${call_px-c_int:.4f}")
-right.metric("Put price at K",  f"${put_px:.4f}",
-             delta=f"Intrinsic ${p_int:.2f}  +  Time ${put_px-p_int:.4f}")
+left.metric("Call price at K",  f"${call_px:.2f}",
+            delta=f"Intrinsic ${c_int:.2f}  +  Time ${call_px - c_int:.2f}")
+right.metric("Put price at K",  f"${put_px:.2f}",
+             delta=f"Intrinsic ${p_int:.2f}  +  Time ${put_px - p_int:.2f}")
 
-# Greeks
 g = greeks(S, K, T, r, sigma)
 if g:
     with st.expander("Greeks for selected K", expanded=True):
@@ -198,7 +199,6 @@ if g:
 
 st.divider()
 
-# Options table
 st.subheader("Options table")
 strikes = gen_strikes(S)
 atm_k   = min(strikes, key=lambda x: abs(x - S))
@@ -237,7 +237,6 @@ st.dataframe(df.style.apply(colour_row, axis=1), use_container_width=True, hide_
 
 st.divider()
 
-# Charts
 chart1, chart2 = st.columns(2)
 
 with chart1:
@@ -263,9 +262,9 @@ with chart1:
 
 with chart2:
     st.subheader("P&L at expiry")
-    spot_range   = np.linspace(S * 0.4, S * 1.6, 300)
-    call_pnl     = [max(0, sp - K) - call_px for sp in spot_range]
-    put_pnl      = [max(0, K - sp) - put_px  for sp in spot_range]
+    spot_range = np.linspace(S * 0.4, S * 1.6, 300)
+    call_pnl   = [max(0, sp - K) - call_px for sp in spot_range]
+    put_pnl    = [max(0, K - sp) - put_px  for sp in spot_range]
 
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(x=spot_range, y=call_pnl, name="Call P&L",
@@ -274,9 +273,9 @@ with chart2:
                               line=dict(color="rgb(239,68,68)", width=2)))
     fig2.add_hline(y=0, line_color="gray", line_width=1)
     fig2.add_vline(x=float(K), line_dash="dash", line_color="orange",
-                   annotation_text=f"K = ${K:,.2f}")
+                   annotation_text=f"K=${K:,.2f}")
     fig2.add_vline(x=float(S), line_dash="dot", line_color="steelblue",
-                   annotation_text=f"S = ${S:,.2f}")
+                   annotation_text=f"S=${S:,.2f}")
     fig2.update_layout(
         height=300, margin=dict(l=0, r=0, t=10, b=0),
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
