@@ -43,7 +43,7 @@ def fetch_stock(ticker):
         t = yf.Ticker(ticker.upper())
         hist = t.history(period="6mo")
         if hist.empty:
-            return None, None, None, None
+            return None, None, None, None, None
         price = round(float(hist["Close"].iloc[-1]), 2)
         prev  = round(float(hist["Close"].iloc[-2]), 2)
         rets  = np.log(hist["Close"] / hist["Close"].shift(1)).dropna()
