@@ -180,22 +180,25 @@ for strike in strikes:
     rows.append({
         "Strike":         f"${strike:,.2f}",
         "Status":         status,
-        "Call price":     f"${c:.4f}",
+        "Call price":     f"${c:.2f}",
         "Call intrinsic": f"${ci:.2f}",
-        "Call time val":  f"${c - ci:.4f}",
-        "Put price":      f"${p:.4f}",
+        "Call time val":  f"${c - ci:.2f}",
+        "Put price":      f"${p:.2f}",
         "Put intrinsic":  f"${pi:.2f}",
-        "Put time val":   f"${p - pi:.4f}",
+        "Put time val":   f"${p - pi:.2f}",
     })
 
 df = pd.DataFrame(rows)
 
 def colour_row(row):
     s = row["Status"]
-    if s == "ATM":      return ["background-color:#dbeafe"] * len(row)
-    if s == "Call ITM": return ["background-color:#dcfce7"] * len(row)
-    if s == "Put ITM":  return ["background-color:#fee2e2"] * len(row)
-    return [""] * len(row)
+    if s == "ATM":
+        return ["background-color:#1e3a5f; color:#93c5fd; font-weight:600"] * len(row)
+    if s == "Call ITM":
+        return ["background-color:#14532d; color:#86efac"] * len(row)
+    if s == "Put ITM":
+        return ["background-color:#7f1d1d; color:#fca5a5"] * len(row)
+    return ["background-color:#1e293b; color:#cbd5e1"] * len(row)
 
 st.dataframe(df.style.apply(colour_row, axis=1), use_container_width=True, hide_index=True)
 
