@@ -4,6 +4,7 @@ import numpy as np
 from scipy.stats import norm
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 
 st.set_page_config(page_title="Stock Options Pricer", layout="wide", page_icon="📈")
 
@@ -57,7 +58,31 @@ def fetch_stock(ticker):
     except Exception:
         return None, None, None, None, None
 
-def strike_step(price):
+@st.cache_data(ttl=3600)
+def resolve_ticker(query):
+    """Convert a company name or partial ticker into a valid ticker symbol."""
+    query = query.strip()
+    if not query:
+        return None, None
+    try:
+        url = (
+            "https://query2.finance.yahoo.com/v1/finance/search"
+            f"?q={requests.utils.quote(query)}&quotesCount=6&newsCount=0&listsCount=0"
+        )
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code != 200:
+            return query.upper(), None
+        quotes = resp.json().get("quotes", [])
+        equities = [q for q in quotes if q.get("quoteType") in ("EQUITY", "ETF")]
+        if not equities:
+            return query.upper(), None
+        best   = equities[0]
+        symbol = best.get("symbol", query.upper())
+        name   = best.get("longname") or best.get("shortname") or symbol
+        return symbol, name
+    except Exception:
+        return query.upper(), None
     if price < 5:     return 0.05
     if price < 20:    return 0.5
     if price < 50:    return 1.0
@@ -76,12 +101,20 @@ with st.sidebar:
     st.title("📈 Stock Options Pricer")
     st.caption("Live Black-Scholes for any stock")
 
-    ticker_input = st.text_input("Stock ticker", value="SPCX",
-                                 help="Try AAPL · TSLA · NVDA · MSFT · AMZN").strip().upper()
+    ticker_input = st.text_input("Search stock", value="SPCX",
+                                 help="Type company name (Tesla) or ticker (TSLA)").strip()
 
-    result = fetch_stock(ticker_input)
+    # Resolve company name → ticker
+    resolved_ticker, resolved_name = resolve_ticker(ticker_input)
+
+    if resolved_ticker and resolved_ticker.upper() != ticker_input.upper():
+        st.caption(f"Matched: **{resolved_ticker}** — {resolved_name or ''}")
+
+    ticker = resolved_ticker or ticker_input.upper()
+
+    result = fetch_stock(ticker)
     if result[0] is None:
-        st.error(f"Could not fetch '{ticker_input}' — check the ticker.")
+        st.error(f"Could not fetch '{ticker}' — try a different name or ticker.")
         st.stop()
 
     live_price, prev_price, hist, hvol, company_name = result
@@ -130,7 +163,7 @@ with st.sidebar:
     st.caption("All prices update instantly as you move any slider.")
 
 # ── Main ──────────────────────────────────────────────
-st.header(f"{company_name}  ·  {ticker_input}")
+st.header(f"{company_name}  ·  {ticker}")
 
 # Summary cards
 c1, c2, c3, c4, c5, c6 = st.columns(6)
