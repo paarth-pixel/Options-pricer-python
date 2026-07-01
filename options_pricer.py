@@ -38,6 +38,45 @@ def greeks(S, K, T, r, sig):
         "Rho Put /1% r":  round(-K * T * np.exp(-r * T) * norm.cdf(-d2) / 100, 4),
     }
 
+# ── Digital / At-Expiry Knockout ───────────────────────
+def bs_digital(S, K, T, r, sig, kind="call"):
+    """Cash-or-nothing digital: pays $1 if condition met at T, else $0."""
+    if T <= 0:
+        if kind == "call":
+            return 1.0 if S > K else 0.0
+        return 1.0 if S < K else 0.0
+    d1 = (np.log(S / K) + (r + sig**2 / 2) * T) / (sig * np.sqrt(T))
+    d2 = d1 - sig * np.sqrt(T)
+    if kind == "call":
+        return np.exp(-r * T) * norm.cdf(d2)
+    return np.exp(-r * T) * norm.cdf(-d2)
+
+def at_expiry_ko(S, K, B, T, r, sig, kind="call"):
+    """
+    Vanilla call/put that is knocked out (pays $0) if the barrier B is
+    breached ONLY at expiry (not monitored along the path). Because the
+    barrier check is a single terminal condition, this is not actually
+    path-dependent -- it can be replicated exactly with vanilla options:
+
+    Call (B above K):  [Call(K) - Call(B)]  -  (B-K) * DigitalCall(B)
+    Put  (B below K):  [Put(K)  - Put(B)]   -  (K-B) * DigitalPut(B)
+
+    The spread gives the normal ramp; the digital leg cancels the flat
+    region that would otherwise remain once the barrier is crossed.
+    """
+    if kind == "call":
+        if T <= 0:
+            return 0.0 if S > B else max(0.0, S - K)
+        spread = bs(S, K, T, r, sig, "call") - bs(S, B, T, r, sig, "call")
+        cap_removal = (B - K) * bs_digital(S, B, T, r, sig, "call")
+        return max(spread - cap_removal, 0.0)
+    else:
+        if T <= 0:
+            return 0.0 if S < B else max(0.0, K - S)
+        spread = bs(S, K, T, r, sig, "put") - bs(S, B, T, r, sig, "put")
+        cap_removal = (K - B) * bs_digital(S, B, T, r, sig, "put")
+        return max(spread - cap_removal, 0.0)
+
 # ── Data fetching ──────────────────────────────────────
 @st.cache_data(ttl=60)
 def fetch_stock(ticker):
@@ -60,25 +99,89 @@ def fetch_stock(ticker):
     except Exception:
         return None, None, None, None, None
 
+def _strike_interp_iv(chain_calls, S):
+    """Linearly interpolate ATM IV between the two listed strikes bracketing S."""
+    calls = chain_calls[chain_calls["impliedVolatility"] > 0].sort_values("strike")
+    if calls.empty:
+        return None
+    strikes = calls["strike"].to_numpy()
+    ivs = calls["impliedVolatility"].to_numpy()
+    if S <= strikes[0]:
+        return float(ivs[0])
+    if S >= strikes[-1]:
+        return float(ivs[-1])
+    idx = int(np.searchsorted(strikes, S))
+    k_lo, k_hi = strikes[idx - 1], strikes[idx]
+    iv_lo, iv_hi = ivs[idx - 1], ivs[idx]
+    if k_hi == k_lo:
+        return float(iv_lo)
+    w = (S - k_lo) / (k_hi - k_lo)
+    return float(iv_lo + w * (iv_hi - iv_lo))
+
 @st.cache_data(ttl=300)
 def fetch_iv(ticker, S, target_date_str):
-    """Fetch ATM implied volatility from the options chain nearest to the target expiry."""
+    """
+    ATM implied vol for the target expiry, interpolated on TWO axes:
+      1. Strike  - linear interpolation between the two listed strikes
+                   bracketing spot (instead of snapping to nearest strike).
+      2. Expiry  - linear interpolation in TOTAL VARIANCE (sigma^2 * T)
+                   between the nearest listed expiry before and after the
+                   target date. Variance (not vol) is the quantity that
+                   scales linearly with time under Black-Scholes, so this
+                   is the standard way term-structure interpolation is done
+                   on a vol surface.
+    Falls back gracefully to a single expiry if the target date is outside
+    the range of listed expiries (can't interpolate, only extrapolate).
+    """
     try:
         t = yf.Ticker(ticker.upper())
         exps = t.options
         if not exps:
             return None, None
+
         target = date.fromisoformat(target_date_str)
-        best_exp = min(exps, key=lambda e: abs((date.fromisoformat(e) - target).days))
-        chain = t.option_chain(best_exp)
-        calls = chain.calls.copy()
-        if calls.empty:
+        today = date.today()
+        exp_dates = [date.fromisoformat(e) for e in exps]
+
+        before = [(e, d) for e, d in zip(exps, exp_dates) if d <= target]
+        after  = [(e, d) for e, d in zip(exps, exp_dates) if d >= target]
+
+        if before and after:
+            e1, d1 = max(before, key=lambda x: x[1])   # nearest expiry <= target
+            e2, d2 = min(after,  key=lambda x: x[1])   # nearest expiry >= target
+        else:
+            # target is outside the listed range - no bracket available,
+            # just use whichever single expiry is closest
+            e1, d1 = min(zip(exps, exp_dates), key=lambda x: abs((x[1] - target).days))
+            e2, d2 = e1, d1
+
+        def atm_iv(exp):
+            chain = t.option_chain(exp)
+            return _strike_interp_iv(chain.calls, S)
+
+        iv1 = atm_iv(e1)
+        iv2 = atm_iv(e2) if e2 != e1 else iv1
+        if iv1 is None and iv2 is None:
             return None, None
-        calls["diff"] = abs(calls["strike"] - S)
-        atm = calls.loc[calls["diff"].idxmin()]
-        iv = float(atm["impliedVolatility"])
-        if iv > 0:
-            return round(iv * 100, 1), best_exp
+        iv1 = iv1 if iv1 is not None else iv2
+        iv2 = iv2 if iv2 is not None else iv1
+
+        T1 = max((d1 - today).days, 1) / 365
+        T2 = max((d2 - today).days, 1) / 365
+        Tt = max((target - today).days, 1) / 365
+
+        if e1 == e2 or T1 == T2:
+            iv_final = iv1
+            label = e1
+        else:
+            var1, var2 = iv1**2 * T1, iv2**2 * T2
+            w = min(max((Tt - T1) / (T2 - T1), 0.0), 1.0)
+            var_t = var1 + w * (var2 - var1)
+            iv_final = np.sqrt(max(var_t, 0.0) / Tt)
+            label = f"{e1} → {e2} (interpolated)"
+
+        if iv_final and iv_final > 0:
+            return round(iv_final * 100, 1), label
         return None, None
     except Exception:
         return None, None
@@ -331,5 +434,80 @@ with chart2:
         legend=dict(x=0, y=1)
     )
     st.plotly_chart(fig2, use_container_width=True)
+
+st.divider()
+
+st.subheader("At-Expiry Knockout Spread")
+st.caption("Barrier checked only on the expiry date, so this is priced exactly with vanilla options — no simulation needed.")
+
+ko1, ko2, ko3 = st.columns([1, 1, 2])
+with ko1:
+    ko_kind = st.selectbox("Type", ["call", "put"], index=0)
+with ko2:
+    default_B = K + step * 10 if ko_kind == "call" else max(step, K - step * 10)
+    B = st.number_input(
+        f"B — Barrier ($) — {'above' if ko_kind=='call' else 'below'} K",
+        min_value=0.01, value=float(default_B), step=float(step), format="%.2f",
+        help="Option pays $0 if the stock finishes past this level on expiry day."
+    )
+with ko3:
+    ko_price = at_expiry_ko(S, K, B, T, r, sigma, ko_kind)
+    vanilla_price = bs(S, K, T, r, sigma, ko_kind)
+    st.metric(
+        f"KO {ko_kind} price  (K={K:.2f}, B={B:.2f})",
+        f"${ko_price:.2f}",
+        delta=f"vs ${vanilla_price:.2f} vanilla  ·  {ko_price - vanilla_price:+.2f} from KO risk"
+    )
+
+kc1, kc2 = st.columns(2)
+
+with kc1:
+    st.caption("Payoff at expiry — the knockout cliff")
+    lo, hi = (K * 0.4, B * 1.5) if ko_kind == "call" else (B * 0.5, K * 1.6)
+    spot_range_ko = np.linspace(lo, hi, 400)
+    if ko_kind == "call":
+        payoff = [ (sp - K) if (K < sp <= B) else 0.0 for sp in spot_range_ko ]
+        vanilla_payoff = [ max(0, sp - K) for sp in spot_range_ko ]
+    else:
+        payoff = [ (K - sp) if (B <= sp < K) else 0.0 for sp in spot_range_ko ]
+        vanilla_payoff = [ max(0, K - sp) for sp in spot_range_ko ]
+
+    fig3 = go.Figure()
+    fig3.add_trace(go.Scatter(x=spot_range_ko, y=vanilla_payoff, name="Vanilla payoff",
+                               line=dict(color="rgba(148,163,184,0.6)", width=2, dash="dot")))
+    fig3.add_trace(go.Scatter(x=spot_range_ko, y=payoff, name="KO payoff",
+                               line=dict(color="rgb(239,68,68)", width=3)))
+    fig3.add_vline(x=float(K), line_dash="dash", line_color="orange", annotation_text=f"K={K:.2f}")
+    fig3.add_vline(x=float(B), line_dash="dash", line_color="red", annotation_text=f"B={B:.2f}")
+    fig3.update_layout(
+        height=320, margin=dict(l=0, r=0, t=10, b=0),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(showgrid=False, title="Stock price at expiry", tickprefix="$"),
+        yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)", title="Payoff ($)"),
+        legend=dict(x=0, y=1)
+    )
+    st.plotly_chart(fig3, use_container_width=True)
+
+with kc2:
+    st.caption("Value today vs spot — how the KO price behaves before expiry")
+    spot_range_val = np.linspace(lo, hi, 200)
+    ko_values = [at_expiry_ko(sp, K, B, T, r, sigma, ko_kind) for sp in spot_range_val]
+    vanilla_values = [bs(sp, K, T, r, sigma, ko_kind) for sp in spot_range_val]
+
+    fig4 = go.Figure()
+    fig4.add_trace(go.Scatter(x=spot_range_val, y=vanilla_values, name="Vanilla value",
+                               line=dict(color="rgba(148,163,184,0.6)", width=2, dash="dot")))
+    fig4.add_trace(go.Scatter(x=spot_range_val, y=ko_values, name="KO value",
+                               line=dict(color="rgb(59,130,246)", width=3)))
+    fig4.add_vline(x=float(S), line_dash="dot", line_color="steelblue", annotation_text=f"S={S:.2f}")
+    fig4.add_vline(x=float(B), line_dash="dash", line_color="red", annotation_text=f"B={B:.2f}")
+    fig4.update_layout(
+        height=320, margin=dict(l=0, r=0, t=10, b=0),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(showgrid=False, title="Stock price today", tickprefix="$"),
+        yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)", title="Option value ($)"),
+        legend=dict(x=0, y=1)
+    )
+    st.plotly_chart(fig4, use_container_width=True)
 
 st.caption("Black-Scholes model · Yahoo Finance · Educational purposes only · Not financial advice")
