@@ -211,6 +211,44 @@ def resolve_ticker(query):
     except Exception:
         return query.upper(), None
 
+@st.cache_data(ttl=3600)
+def fetch_rate_curve():
+    """
+    Coarse US Treasury yield curve pulled from Yahoo's index tickers:
+      ^IRX = 13-week T-bill   (~0.25y)
+      ^FVX = 5-year note      (5y)
+      ^TNX = 10-year note     (10y)
+      ^TYX = 30-year bond     (30y)
+    Returns a sorted list of (maturity_years, yield_pct) pillars.
+    Note: this is only 4 points (no 1mo/2y/7y pillars like the real
+    Treasury par curve has), so it's an approximation, not a full par
+    curve — fine for single-name option pricing at typical expiries.
+    """
+    pillars = {0.25: "^IRX", 5.0: "^FVX", 10.0: "^TNX", 30.0: "^TYX"}
+    curve = []
+    for mat, sym in pillars.items():
+        try:
+            h = yf.Ticker(sym).history(period="5d")
+            if not h.empty:
+                curve.append((mat, float(h["Close"].iloc[-1])))
+        except Exception:
+            continue
+    return sorted(curve)
+
+def interp_rate(T, curve):
+    """Linearly interpolate the yield curve at maturity T years; flat-extrapolate past the ends."""
+    if not curve:
+        return None
+    if T <= curve[0][0]:
+        return curve[0][1]
+    if T >= curve[-1][0]:
+        return curve[-1][1]
+    for (t1, y1), (t2, y2) in zip(curve, curve[1:]):
+        if t1 <= T <= t2:
+            w = (T - t1) / (t2 - t1)
+            return y1 + w * (y2 - y1)
+    return curve[-1][1]
+
 # ── Helpers ────────────────────────────────────────────
 def strike_step(price):
     if price < 5:    return 0.05
@@ -287,11 +325,22 @@ with st.sidebar:
     T = max(T_days, 1) / 365
     st.caption(f"**{T_days} days** to expiry  ({T:.4f} years)")
 
-    # r — number input
+    # r — auto-filled by interpolating the live Treasury curve, editable
+    rate_curve = fetch_rate_curve()
+    auto_r = interp_rate(T, rate_curve)
+    if rate_curve and auto_r is not None:
+        pillar_str = ", ".join(f"{m:g}y={y:.2f}%" for m, y in rate_curve)
+        st.caption(f"Curve: {pillar_str}  →  interpolated to {auto_r:.2f}% at T={T:.2f}y")
+        r_default = round(auto_r, 2)
+        r_help = f"Auto-filled by interpolating the live Treasury curve at your option's T={T:.2f}y. Edit to override."
+    else:
+        r_default = 4.0
+        r_help = "Could not fetch the Treasury curve — using a 4.00% default. Edit to override."
+
     r_pct = st.number_input(
         "r — Risk-free rate (%)",
-        min_value=0.0, max_value=50.0, value=4.0, step=0.25, format="%.2f",
-        help="US Treasury yield used as the risk-free rate."
+        min_value=0.0, max_value=50.0, value=float(r_default), step=0.25, format="%.2f",
+        help=r_help
     )
     r = r_pct / 100
 
