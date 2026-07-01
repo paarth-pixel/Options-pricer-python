@@ -5,6 +5,7 @@ from scipy.stats import norm
 import pandas as pd
 import plotly.graph_objects as go
 import requests
+from datetime import date, timedelta
 
 st.set_page_config(page_title="Stock Options Pricer", layout="wide", page_icon="📈")
 
@@ -59,6 +60,29 @@ def fetch_stock(ticker):
     except Exception:
         return None, None, None, None, None
 
+@st.cache_data(ttl=300)
+def fetch_iv(ticker, S, target_date_str):
+    """Fetch ATM implied volatility from the options chain nearest to the target expiry."""
+    try:
+        t = yf.Ticker(ticker.upper())
+        exps = t.options
+        if not exps:
+            return None, None
+        target = date.fromisoformat(target_date_str)
+        best_exp = min(exps, key=lambda e: abs((date.fromisoformat(e) - target).days))
+        chain = t.option_chain(best_exp)
+        calls = chain.calls.copy()
+        if calls.empty:
+            return None, None
+        calls["diff"] = abs(calls["strike"] - S)
+        atm = calls.loc[calls["diff"].idxmin()]
+        iv = float(atm["impliedVolatility"])
+        if iv > 0:
+            return round(iv * 100, 1), best_exp
+        return None, None
+    except Exception:
+        return None, None
+
 @st.cache_data(ttl=3600)
 def resolve_ticker(query):
     query = query.strip()
@@ -110,10 +134,8 @@ with st.sidebar:
     ).strip()
 
     resolved_ticker, resolved_name = resolve_ticker(ticker_input)
-
     if resolved_ticker and resolved_ticker.upper() != ticker_input.upper():
         st.caption(f"Matched: **{resolved_ticker}** — {resolved_name or ''}")
-
     ticker = resolved_ticker or ticker_input.upper()
 
     result = fetch_stock(ticker)
@@ -136,35 +158,60 @@ with st.sidebar:
     st.subheader("Black-Scholes inputs")
 
     step  = strike_step(live_price)
-    lo    = round(max(step, round(live_price * 0.25 / step) * step), 4)
-    hi_s  = round(round(live_price * 4.0 / step) * step, 4)
-    hi_k  = round(round(live_price * 3.0 / step) * step, 4)
-    s_def = round(round(live_price / step) * step, 4)
 
-    S = st.slider(
-        "S — Stock price ($)", min_value=lo, max_value=hi_s,
-        value=float(s_def), step=float(step),
-        help="Defaults to live price — drag to model scenarios."
+    # S and K — number inputs
+    S = st.number_input(
+        "S — Stock price ($)",
+        min_value=0.01, value=float(live_price), step=float(step), format="%.2f",
+        help="Current stock price. Edit to model scenarios."
     )
-    K = st.slider(
-        "K — Strike price ($)", min_value=lo, max_value=hi_k,
-        value=float(s_def), step=float(step),
+    K = st.number_input(
+        "K — Strike price ($)",
+        min_value=0.01, value=float(round(round(live_price / step) * step, 2)),
+        step=float(step), format="%.2f",
         help="The fixed price written into the option contract."
     )
-    T_days = st.slider("T — Days to expiry", min_value=1, max_value=730, value=180, step=1)
-    T = T_days / 365
 
-    r_pct = st.slider("r — Risk-free rate (%)", min_value=0.0, max_value=15.0, value=4.0, step=0.25)
+    # Expiry date — calendar picker
+    default_expiry = date.today() + timedelta(days=180)
+    expiry_date = st.date_input(
+        "Expiry date",
+        value=default_expiry,
+        min_value=date.today() + timedelta(days=1),
+        help="Pick any expiry date — no limit on how far out."
+    )
+    T_days = (expiry_date - date.today()).days
+    T = max(T_days, 1) / 365
+    st.caption(f"**{T_days} days** to expiry  ({T:.4f} years)")
+
+    # r — number input
+    r_pct = st.number_input(
+        "r — Risk-free rate (%)",
+        min_value=0.0, max_value=50.0, value=4.0, step=0.25, format="%.2f",
+        help="US Treasury yield used as the risk-free rate."
+    )
     r = r_pct / 100
 
-    default_vol = max(10, min(int(hvol), 200)) if hvol else 30
-    sig_pct = st.slider("σ — Implied volatility (%)", min_value=5, max_value=300,
-                        value=default_vol, step=1,
-                        help="Defaults to 30-day historical vol of the stock.")
+    # σ — fetched from options chain, shown as editable number input
+    market_iv, used_exp = fetch_iv(ticker, S, expiry_date.isoformat())
+    if market_iv:
+        st.caption(f"Market IV fetched from options chain expiry **{used_exp}**")
+        default_sig = market_iv
+        iv_source = f"Market IV ({used_exp})"
+    else:
+        default_sig = max(10.0, float(hvol)) if hvol else 30.0
+        iv_source = "30-day historical vol (no options chain available)"
+        st.caption(f"ℹ️ No options chain found — using historical vol as default.")
+
+    sig_pct = st.number_input(
+        "σ — Implied volatility (%)",
+        min_value=0.1, max_value=1000.0, value=float(default_sig), step=0.5, format="%.1f",
+        help=f"Auto-filled from: {iv_source}. Edit to override."
+    )
     sigma = sig_pct / 100
 
     st.divider()
-    st.caption("All prices update instantly as you move any slider.")
+    st.caption("All values update instantly as you edit any field.")
 
 # ── Main ───────────────────────────────────────────────
 st.header(f"{company_name}  ·  {ticker}")
@@ -172,9 +219,9 @@ st.header(f"{company_name}  ·  {ticker}")
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("S  (stock price)", f"${S:,.2f}")
 c2.metric("K  (strike)",      f"${K:,.2f}")
-c3.metric("T  (days)",        T_days)
+c3.metric("Expiry",           str(expiry_date))
 c4.metric("r  (rate)",        f"{r_pct:.2f}%")
-c5.metric("σ  (vol)",         f"{sig_pct}%")
+c5.metric("σ  (vol)",         f"{sig_pct:.1f}%")
 c6.metric("T  (years)",       f"{T:.4f}")
 
 st.divider()
@@ -269,7 +316,7 @@ with chart2:
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(x=spot_range, y=call_pnl, name="Call P&L",
                               line=dict(color="rgb(34,197,94)", width=2)))
-    fig2.add_trace(go.Scatter(x=spot_range, y=put_pnl,  name="Put P&L",
+    fig2.add_trace(go.Scatter(x=spot_range, y=put_pnl, name="Put P&L",
                               line=dict(color="rgb(239,68,68)", width=2)))
     fig2.add_hline(y=0, line_color="gray", line_width=1)
     fig2.add_vline(x=float(K), line_dash="dash", line_color="orange",
